@@ -38,3 +38,30 @@ class OkResponse(BaseModel):
     ok: Literal[True] = True
     message: str = "ok"
     data: Any | None = None
+
+
+class QaSearchItem(BaseModel):
+    doc_id: str
+    file_name: str
+    service_name: str | None = None
+    organization: str | None = None
+    address: str | None = None
+    updated_at: str | None = None
+    materials_count: int = 0
+    steps_count: int = 0
+    laws_count: int = 0
+    score: float = 0.0
+    matched_fields: list[str] = []
+
+
+class QaDocDetail(BaseModel):
+    doc_id: str
+    file_name: str
+    updated_at: str | None = None
+    service_name: str | None = None
+    organization: str | None = None
+    address: str | None = None
+    materials: list[str] = []
+    steps: list[str] = []
+    laws: list[str] = []
+    entities: list[str] = []

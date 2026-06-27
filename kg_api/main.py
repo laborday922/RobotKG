@@ -12,7 +12,7 @@ from kg_api.config import settings
 
 from kg_api.extractor import extract_document
 from kg_api.neo4j_client import Neo4jClient, neo4j_error_to_message
-from kg_api.schemas import DeleteFileResponse, OkResponse, UpsertFileRequest, UpsertFileResponse
+from kg_api.schemas import DeleteFileResponse, OkResponse, QaDocDetail, QaSearchItem, UpsertFileRequest, UpsertFileResponse
 
 
 logger = logging.getLogger("uvicorn.error")
@@ -205,3 +205,30 @@ def get_file(file_id: str, client: Neo4jClient = Depends(neo4j)) -> OkResponse:
     if not data:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="file not found")
     return OkResponse(ok=True, message="ok", data=data)
+
+# dify用的两个接口
+# 用关键词检索候选文档，返回 doc_id
+@app.get("/qa/search", response_model=OkResponse, tags=["qa"], dependencies=[Depends(auth_dependency)])
+def qa_search(query: str, top_k: int = 5, client: Neo4jClient = Depends(neo4j)) -> OkResponse:
+    try:
+        results = client.search_documents(query=query, top_k=top_k)
+        items = [QaSearchItem(**r).model_dump() for r in results]
+        return OkResponse(ok=True, message="ok", data={"query": query, "top_k": min(max(int(top_k), 1), 20), "results": items})
+    except Exception as e:
+        msg = neo4j_error_to_message(e)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=msg)
+
+# 拿某个 doc_id 的结构化详情
+@app.get("/qa/doc/{doc_id}", response_model=OkResponse, tags=["qa"], dependencies=[Depends(auth_dependency)])
+def qa_doc_detail(doc_id: str, client: Neo4jClient = Depends(neo4j)) -> OkResponse:
+    try:
+        detail = client.get_document_detail(doc_id=doc_id)
+        if not detail:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="file not found")
+        data = QaDocDetail(**detail).model_dump()
+        return OkResponse(ok=True, message="ok", data=data)
+    except HTTPException:
+        raise
+    except Exception as e:
+        msg = neo4j_error_to_message(e)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=msg)

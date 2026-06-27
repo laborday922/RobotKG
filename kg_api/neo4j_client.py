@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Any
 
@@ -14,6 +15,54 @@ logger = logging.getLogger("uvicorn.error")
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+_STOPWORDS = {
+    "如何",
+    "怎么",
+    "怎么样",
+    "怎样",
+    "办理",
+    "申请",
+    "需要",
+    "材料",
+    "流程",
+    "条件",
+    "要求",
+    "哪些",
+    "什么",
+    "我想",
+    "我要",
+    "帮我",
+    "一下",
+    "一下吧",
+    "请问",
+}
+
+
+def _tokenize_query(query: str) -> list[str]:
+    q = (query or "").strip().lower()
+    if not q:
+        return []
+    parts = re.split(r"[\s,，。；;、/\\|]+", q)
+    tokens: list[str] = []
+    for p in parts:
+        p = p.strip()
+        if not p:
+            continue
+        if p in _STOPWORDS:
+            continue
+        if len(p) == 1:
+            continue
+        tokens.append(p)
+    uniq: list[str] = []
+    seen: set[str] = set()
+    for t in tokens:
+        if t in seen:
+            continue
+        seen.add(t)
+        uniq.append(t)
+    return uniq[:12]
 
 
 class Neo4jClient:
@@ -45,6 +94,164 @@ class Neo4jClient:
     def ping(self) -> None:
         with self._driver.session(database=self._database) as session:
             session.run("RETURN 1").consume()
+
+    def search_documents(self, *, query: str, top_k: int = 5) -> list[dict[str, Any]]:
+        top_k = int(top_k)
+        if top_k <= 0:
+            top_k = 5
+        if top_k > 20:
+            top_k = 20
+
+        query_lower = (query or "").strip().lower()
+        tokens = _tokenize_query(query_lower)
+        if not tokens and query_lower:
+            tokens = [query_lower]
+
+        cypher = """
+        MATCH (d:Document)
+        OPTIONAL MATCH (d)-[:DESCRIBES]->(s:ServiceItem)
+        OPTIONAL MATCH (s)-[:HANDLED_BY {doc_id: d.id}]->(o:Organization)
+        OPTIONAL MATCH (s)-[:HANDLED_AT {doc_id: d.id}]->(loc:Location)
+        OPTIONAL MATCH (s)-[:REQUIRES {doc_id: d.id}]->(m:Material)
+        OPTIONAL MATCH (s)-[:BASED_ON {doc_id: d.id}]->(l:Law)
+        OPTIONAL MATCH (s)-[:HAS_STEP {doc_id: d.id}]->(st:Step)
+        OPTIONAL MATCH (d)-[:MENTIONS]->(e:Entity)
+        WITH d, s,
+             collect(distinct o.name) AS orgs,
+             collect(distinct loc.address) AS addrs,
+             collect(distinct m.name) AS materials,
+             collect(distinct l.title) AS laws,
+             collect(distinct st.index) AS step_indexes,
+             collect(distinct e.name) AS entities
+        WITH d, s,
+             head([x IN orgs WHERE x IS NOT NULL]) AS organization,
+             head([x IN addrs WHERE x IS NOT NULL]) AS address,
+             materials, laws, step_indexes, entities,
+             toLower(coalesce(d.name, "")) AS dn,
+             toLower(coalesce(d.content, "")) AS dc,
+             toLower(coalesce(s.name, "")) AS sn,
+             toLower(coalesce(organization, "")) AS on,
+             toLower(coalesce(address, "")) AS an
+        WITH d, s, organization, address, materials, laws, step_indexes, entities,
+             reduce(sc = 0.0, t IN $tokens |
+               sc
+               + CASE WHEN sn CONTAINS t THEN 6.0 ELSE 0.0 END
+               + CASE WHEN dn CONTAINS t THEN 4.0 ELSE 0.0 END
+               + CASE WHEN any(x IN materials WHERE toLower(x) CONTAINS t) THEN 2.0 ELSE 0.0 END
+               + CASE WHEN any(x IN laws WHERE toLower(x) CONTAINS t) THEN 1.5 ELSE 0.0 END
+               + CASE WHEN on CONTAINS t THEN 1.5 ELSE 0.0 END
+               + CASE WHEN an CONTAINS t THEN 1.5 ELSE 0.0 END
+               + CASE WHEN any(x IN entities WHERE toLower(x) CONTAINS t) THEN 1.0 ELSE 0.0 END
+               + CASE WHEN dc CONTAINS t THEN 0.5 ELSE 0.0 END
+             ) AS score,
+             dn, sn, dc, on, an
+        WHERE score > 0 OR ($query_lower <> "" AND (sn CONTAINS $query_lower OR dn CONTAINS $query_lower OR dc CONTAINS $query_lower))
+        WITH d, s, organization, address, materials, laws, step_indexes,
+             CASE WHEN score > 0 THEN score ELSE 0.1 END AS score2,
+             [f IN [
+               CASE WHEN sn CONTAINS $query_lower THEN "service.name" END,
+               CASE WHEN dn CONTAINS $query_lower THEN "document.name" END,
+               CASE WHEN on CONTAINS $query_lower THEN "organization" END,
+               CASE WHEN an CONTAINS $query_lower THEN "address" END
+             ] WHERE f IS NOT NULL] AS matched_fields
+        RETURN d.id AS doc_id,
+               d.name AS file_name,
+               d.updated_at AS updated_at,
+               s.name AS service_name,
+               organization AS organization,
+               address AS address,
+               size(materials) AS materials_count,
+               size(step_indexes) AS steps_count,
+               size(laws) AS laws_count,
+               score2 AS score,
+               matched_fields AS matched_fields
+        ORDER BY score DESC, updated_at DESC
+        LIMIT $top_k
+        """
+        params = {"tokens": tokens, "query_lower": query_lower, "top_k": top_k}
+        with self._driver.session(database=self._database) as session:
+            records = session.run(cypher, params)
+            out: list[dict[str, Any]] = []
+            for r in records:
+                out.append(
+                    {
+                        "doc_id": r["doc_id"],
+                        "file_name": r["file_name"],
+                        "service_name": r["service_name"],
+                        "organization": r["organization"],
+                        "address": r["address"],
+                        "updated_at": r["updated_at"],
+                        "materials_count": int(r["materials_count"] or 0),
+                        "steps_count": int(r["steps_count"] or 0),
+                        "laws_count": int(r["laws_count"] or 0),
+                        "score": float(r["score"] or 0.0),
+                        "matched_fields": list(r["matched_fields"] or []),
+                    }
+                )
+            return out
+
+    def get_document_detail(self, *, doc_id: str) -> dict[str, Any] | None:
+        cypher = """
+        MATCH (d:Document {id: $doc_id})
+        OPTIONAL MATCH (d)-[:DESCRIBES]->(s:ServiceItem)
+        CALL {
+          WITH s
+          OPTIONAL MATCH (s)-[:REQUIRES {doc_id: $doc_id}]->(m:Material)
+          RETURN collect(distinct m.name) AS materials
+        }
+        CALL {
+          WITH s
+          OPTIONAL MATCH (s)-[:HAS_STEP {doc_id: $doc_id}]->(st:Step)
+          WITH st ORDER BY st.index ASC
+          RETURN collect(st.text) AS steps
+        }
+        CALL {
+          WITH s
+          OPTIONAL MATCH (s)-[:BASED_ON {doc_id: $doc_id}]->(l:Law)
+          RETURN collect(distinct l.title) AS laws
+        }
+        CALL {
+          WITH d
+          OPTIONAL MATCH (d)-[:MENTIONS]->(e:Entity)
+          RETURN collect(distinct e.name) AS entities
+        }
+        CALL {
+          WITH s
+          OPTIONAL MATCH (s)-[:HANDLED_BY {doc_id: $doc_id}]->(o:Organization)
+          RETURN head(collect(distinct o.name)) AS organization
+        }
+        CALL {
+          WITH s
+          OPTIONAL MATCH (s)-[:HANDLED_AT {doc_id: $doc_id}]->(loc:Location)
+          RETURN head(collect(distinct loc.address)) AS address
+        }
+        RETURN d.id AS doc_id,
+               d.name AS file_name,
+               d.updated_at AS updated_at,
+               s.name AS service_name,
+               organization AS organization,
+               address AS address,
+               materials AS materials,
+               steps AS steps,
+               laws AS laws,
+               entities AS entities
+        """
+        with self._driver.session(database=self._database) as session:
+            r = session.run(cypher, doc_id=doc_id).single()
+            if not r:
+                return None
+            return {
+                "doc_id": r["doc_id"],
+                "file_name": r["file_name"],
+                "updated_at": r["updated_at"],
+                "service_name": r["service_name"],
+                "organization": r["organization"],
+                "address": r["address"],
+                "materials": list(r["materials"] or []),
+                "steps": list(r["steps"] or []),
+                "laws": list(r["laws"] or []),
+                "entities": list(r["entities"] or []),
+            }
 
     def upsert_document_graph(
         self,
