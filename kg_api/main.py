@@ -212,6 +212,7 @@ def get_file(file_id: str, client: Neo4jClient = Depends(neo4j)) -> OkResponse:
 @app.get("/qa/search", response_model=OkResponse, tags=["qa"], dependencies=[Depends(auth_dependency)])
 def qa_search(query: str, top_k: int = 5, client: Neo4jClient = Depends(neo4j)) -> OkResponse:
     try:
+        logger.info("qa.search query=%r top_k=%s", query, top_k)
         results = client.search_documents(query=query, top_k=top_k)
         items = [QaSearchItem(**r).model_dump() for r in results]
         return OkResponse(ok=True, message="ok", data={"query": query, "top_k": min(max(int(top_k), 1), 20), "results": items})
