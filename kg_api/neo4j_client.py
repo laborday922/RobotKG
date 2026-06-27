@@ -39,6 +39,65 @@ _STOPWORDS = {
     "请问",
 }
 
+_ABBREV_MAP: dict[str, str] = {
+    "社保": "社会保险",
+    "医保": "医疗保险",
+}
+
+_KEYWORDS = [
+    "生育津贴",
+    "社会保险",
+    "社保",
+    "医疗保险",
+    "医保",
+    "公积金",
+    "缴纳",
+    "参保",
+    "转出",
+    "转入",
+    "报销",
+    "补贴",
+    "津贴",
+]
+
+
+def _build_query_variants(query: str) -> list[str]:
+    q = (query or "").strip().lower()
+    if not q:
+        return []
+
+    variants: list[str] = [q]
+    for k, v in _ABBREV_MAP.items():
+        if k.lower() in q:
+            variants.append(q.replace(k.lower(), v.lower()))
+
+    reduced = q
+    for w in _STOPWORDS:
+        reduced = reduced.replace(w.lower(), "")
+    reduced = re.sub(r"\s+", " ", reduced).strip()
+    if reduced and reduced != q:
+        variants.append(reduced)
+        for k, v in _ABBREV_MAP.items():
+            if k.lower() in reduced:
+                variants.append(reduced.replace(k.lower(), v.lower()))
+
+    for kw in _KEYWORDS:
+        if kw.lower() in q:
+            variants.append(kw.lower())
+
+    uniq: list[str] = []
+    seen: set[str] = set()
+    for x in variants:
+        x = x.strip()
+        if not x:
+            continue
+        if x in seen:
+            continue
+        seen.add(x)
+        uniq.append(x)
+    return uniq[:12]
+
+
 
 def _tokenize_query(query: str) -> list[str]:
     q = (query or "").strip().lower()
@@ -54,6 +113,10 @@ def _tokenize_query(query: str) -> list[str]:
             continue
         if len(p) == 1:
             continue
+        for kw in _KEYWORDS:
+            kw2 = kw.lower()
+            if kw2 in p and kw2 not in _STOPWORDS:
+                tokens.append(kw2)
         tokens.append(p)
     uniq: list[str] = []
     seen: set[str] = set()
@@ -62,7 +125,6 @@ def _tokenize_query(query: str) -> list[str]:
             continue
         seen.add(t)
         uniq.append(t)
-    return uniq[:12]
 
 
 class Neo4jClient:
@@ -103,7 +165,12 @@ class Neo4jClient:
             top_k = 20
 
         query_lower = (query or "").strip().lower()
-        tokens = _tokenize_query(query_lower)
+        queries = _build_query_variants(query_lower)
+        tokens: list[str] = []
+        for q in queries:
+            tokens.extend(_tokenize_query(q))
+        if not tokens:
+            tokens = _tokenize_query(query_lower)
         if not tokens and query_lower:
             tokens = [query_lower]
 
@@ -149,14 +216,14 @@ class Neo4jClient:
                + CASE WHEN dc CONTAINS t THEN 0.5 ELSE 0.0 END
              ) AS score,
              dn, sn, dc, on, an
-        WHERE score > 0 OR ($query_lower <> "" AND (sn CONTAINS $query_lower OR dn CONTAINS $query_lower OR dc CONTAINS $query_lower))
+        WHERE score > 0 OR any(q IN $queries WHERE q <> "" AND (sn CONTAINS q OR dn CONTAINS q OR dc CONTAINS q))
         WITH d, s, organization, address, materials, laws, step_indexes,
              CASE WHEN score > 0 THEN score ELSE 0.1 END AS score2,
              [f IN [
-               CASE WHEN sn CONTAINS $query_lower THEN "service.name" END,
-               CASE WHEN dn CONTAINS $query_lower THEN "document.name" END,
-               CASE WHEN on CONTAINS $query_lower THEN "organization" END,
-               CASE WHEN an CONTAINS $query_lower THEN "address" END
+              CASE WHEN any(q IN $queries WHERE q <> "" AND sn CONTAINS q) THEN "service.name" END,
+              CASE WHEN any(q IN $queries WHERE q <> "" AND dn CONTAINS q) THEN "document.name" END,
+              CASE WHEN any(q IN $queries WHERE q <> "" AND on CONTAINS q) THEN "organization" END,
+              CASE WHEN any(q IN $queries WHERE q <> "" AND an CONTAINS q) THEN "address" END
              ] WHERE f IS NOT NULL] AS matched_fields
         RETURN d.id AS doc_id,
                d.name AS file_name,
@@ -172,7 +239,7 @@ class Neo4jClient:
         ORDER BY score DESC, updated_at DESC
         LIMIT $top_k
         """
-        params = {"tokens": tokens, "query_lower": query_lower, "top_k": top_k}
+        params = {"tokens": tokens, "queries": queries, "query_lower": query_lower, "top_k": top_k}
         with self._driver.session(database=self._database) as session:
             records = session.run(cypher, params)
             out: list[dict[str, Any]] = []
