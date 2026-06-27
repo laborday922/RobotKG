@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+import logging
+import time
+import uuid
 
 from fastapi.exceptions import RequestValidationError
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
@@ -12,12 +15,13 @@ from kg_api.neo4j_client import Neo4jClient, neo4j_error_to_message
 from kg_api.schemas import DeleteFileResponse, OkResponse, UpsertFileRequest, UpsertFileResponse
 
 
+logger = logging.getLogger("uvicorn.error")
+
 
 
 def _require_token(authorization: str | None) -> None:
     if not settings.api_token:
         return
-    if not authorization:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="missing token")
     prefix = "Bearer "
     if not authorization.startswith(prefix):
@@ -44,6 +48,7 @@ async def lifespan(app: FastAPI):
         try:
             client.ensure_schema()
         except Exception as e:
+            logger.exception("neo4j schema init failed: %s", e)
             init_error = str(e)
     app.state.neo4j = client
     app.state.neo4j_init_error = init_error
@@ -72,10 +77,18 @@ async def validation_exception_handler(_: Request, exc: RequestValidationError) 
 
 
 @app.exception_handler(Exception)
-async def unhandled_exception_handler(_: Request, __: Exception) -> JSONResponse:
+async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    req_id = uuid.uuid4().hex[:10]
+    logger.exception(
+        "unhandled exception (req_id=%s) %s %s",
+        req_id,
+        request.method,
+        str(request.url),
+        exc_info=exc,
+    )
     return JSONResponse(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-        content={"ok": False, "message": "internal error"},
+        content={"ok": False, "message": f"internal error (req_id={req_id})"},
     )
 
 
@@ -102,12 +115,24 @@ def ready(client: Neo4jClient = Depends(neo4j)) -> OkResponse:
 
 @app.post("/files/upsert", response_model=OkResponse, tags=["files"], dependencies=[Depends(auth_dependency)])
 def upsert_file(payload: UpsertFileRequest, client: Neo4jClient = Depends(neo4j)) -> OkResponse:
+    req_id = uuid.uuid4().hex[:10]
     try:
+        t0 = time.perf_counter()
         heading_aliases = None
         if isinstance(payload.metadata, dict):
             raw = payload.metadata.get("field_mapping") or payload.metadata.get("heading_aliases")
             if isinstance(raw, dict):
                 heading_aliases = {str(k): str(v) for k, v in raw.items()}
+
+        metadata_keys = sorted([str(k) for k in payload.metadata.keys()]) if isinstance(payload.metadata, dict) else None
+        logger.info(
+            "files.upsert start (req_id=%s) file_id=%s file_name=%s content_len=%s metadata_keys=%s",
+            req_id,
+            payload.file_id,
+            payload.file_name,
+            len(payload.content or ""),
+            metadata_keys,
+        )
 
         extracted = extract_document(
             file_name=payload.file_name,
@@ -115,6 +140,7 @@ def upsert_file(payload: UpsertFileRequest, client: Neo4jClient = Depends(neo4j)
             llm=None,
             heading_aliases=heading_aliases,
         )
+        t1 = time.perf_counter()
         entities = sorted(extracted.graph.entities)
         relations = extracted.graph.relations
         client.upsert_document_graph(
@@ -126,6 +152,16 @@ def upsert_file(payload: UpsertFileRequest, client: Neo4jClient = Depends(neo4j)
             entities=entities,
             relations=relations,
         )
+        t2 = time.perf_counter()
+        logger.info(
+            "files.upsert ok (req_id=%s) entities=%s relations=%s extract_ms=%s upsert_ms=%s total_ms=%s",
+            req_id,
+            len(entities),
+            len(relations),
+            int((t1 - t0) * 1000),
+            int((t2 - t1) * 1000),
+            int((t2 - t0) * 1000),
+        )
         data = UpsertFileResponse(
             file_id=payload.file_id,
             entities_count=len(entities),
@@ -134,22 +170,33 @@ def upsert_file(payload: UpsertFileRequest, client: Neo4jClient = Depends(neo4j)
         return OkResponse(ok=True, message="upserted", data=data.model_dump())
     except Exception as e:
         msg = neo4j_error_to_message(e)
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=msg)
+        logger.exception(
+            "files.upsert failed (req_id=%s) file_id=%s file_name=%s err=%s",
+            req_id,
+            getattr(payload, "file_id", None),
+            getattr(payload, "file_name", None),
+            e,
+        )
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"{msg} (req_id={req_id})")
 
 
 @app.delete("/files/{file_id}", response_model=OkResponse, tags=["files"], dependencies=[Depends(auth_dependency)])
 def delete_file(file_id: str, cleanup_orphans: bool = True, client: Neo4jClient = Depends(neo4j)) -> OkResponse:
+    req_id = uuid.uuid4().hex[:10]
     try:
+        logger.info("files.delete start (req_id=%s) file_id=%s cleanup_orphans=%s", req_id, file_id, cleanup_orphans)
         deleted = client.delete_document_graph(doc_id=file_id, cleanup_orphans=cleanup_orphans)
         if not deleted:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="file not found")
         data = DeleteFileResponse(file_id=file_id, deleted=True)
+        logger.info("files.delete ok (req_id=%s) file_id=%s", req_id, file_id)
         return OkResponse(ok=True, message="deleted", data=data.model_dump())
     except HTTPException:
         raise
     except Exception as e:
         msg = neo4j_error_to_message(e)
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=msg)
+        logger.exception("files.delete failed (req_id=%s) file_id=%s err=%s", req_id, file_id, e)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"{msg} (req_id={req_id})")
 
 
 @app.get("/files/{file_id}", response_model=OkResponse, tags=["files"], dependencies=[Depends(auth_dependency)])

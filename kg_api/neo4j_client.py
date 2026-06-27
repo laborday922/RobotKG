@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime, timezone
 from typing import Any
 
 from neo4j import GraphDatabase
 from neo4j.exceptions import Neo4jError
+
+
+logger = logging.getLogger("uvicorn.error")
 
 
 def _utc_now_iso() -> str:
@@ -24,10 +28,19 @@ class Neo4jClient:
         statements = [
             "CREATE CONSTRAINT document_id IF NOT EXISTS FOR (d:Document) REQUIRE d.id IS UNIQUE",
             "CREATE CONSTRAINT entity_name IF NOT EXISTS FOR (e:Entity) REQUIRE e.name IS UNIQUE",
+            "CREATE CONSTRAINT serviceitem_name IF NOT EXISTS FOR (s:ServiceItem) REQUIRE s.name IS UNIQUE",
+            "CREATE CONSTRAINT material_name IF NOT EXISTS FOR (m:Material) REQUIRE m.name IS UNIQUE",
+            "CREATE CONSTRAINT law_title IF NOT EXISTS FOR (l:Law) REQUIRE l.title IS UNIQUE",
+            "CREATE CONSTRAINT org_name IF NOT EXISTS FOR (o:Organization) REQUIRE o.name IS UNIQUE",
+            "CREATE CONSTRAINT location_address IF NOT EXISTS FOR (a:Location) REQUIRE a.address IS UNIQUE",
+            "CREATE CONSTRAINT step_key IF NOT EXISTS FOR (st:Step) REQUIRE (st.doc_id, st.index) IS UNIQUE",
         ]
         with self._driver.session(database=self._database) as session:
             for cypher in statements:
-                session.run(cypher).consume()
+                try:
+                    session.run(cypher).consume()
+                except Neo4jError as e:
+                    logger.exception("neo4j schema statement failed: %s", cypher)
 
     def ping(self) -> None:
         with self._driver.session(database=self._database) as session:
@@ -46,6 +59,24 @@ class Neo4jClient:
     ) -> None:
         metadata_json = json.dumps(metadata, ensure_ascii=False) if metadata is not None else None
         structured_json = json.dumps(structured, ensure_ascii=False) if structured is not None else None
+
+        values = (structured or {}).get("values") if isinstance(structured, dict) else None
+        if not isinstance(values, dict):
+            values = {}
+
+        service_name = str(values.get("service_item") or "").strip() or doc_name
+        materials = values.get("materials") if isinstance(values.get("materials"), list) else []
+        materials = [str(x).strip() for x in materials if isinstance(x, str) and str(x).strip()]
+
+        process = values.get("process") if isinstance(values.get("process"), list) else []
+        steps = [{"index": idx + 1, "text": str(x).strip()} for idx, x in enumerate(process) if isinstance(x, str) and str(x).strip()]
+
+        policy_basis = values.get("policy_basis") if isinstance(values.get("policy_basis"), list) else []
+        laws = [str(x).strip() for x in policy_basis if isinstance(x, str) and str(x).strip()]
+
+        organization = str(values.get("organization") or "").strip() or None
+        address = str(values.get("address") or "").strip() or None
+
         cypher = """
         MERGE (d:Document {id: $doc_id})
         SET d.name = $doc_name,
@@ -57,8 +88,14 @@ class Neo4jClient:
         OPTIONAL MATCH (d)-[m:MENTIONS]->(:Entity)
         DELETE m
         WITH d
-        OPTIONAL MATCH ()-[r:RELATED {doc_id: $doc_id}]->()
+        OPTIONAL MATCH (d)-[ds:DESCRIBES]->(:ServiceItem)
+        DELETE ds
+        WITH d
+        OPTIONAL MATCH ()-[r]->() WHERE r.doc_id = $doc_id
         DELETE r
+        WITH d
+        OPTIONAL MATCH (st:Step {doc_id: $doc_id})
+        DETACH DELETE st
         WITH d
         UNWIND $entities AS entity_name
         MERGE (e:Entity {name: entity_name})
@@ -68,6 +105,32 @@ class Neo4jClient:
         MERGE (a:Entity {name: rel.source})
         MERGE (b:Entity {name: rel.target})
         MERGE (a)-[:RELATED {doc_id: $doc_id, type: rel.type}]->(b)
+        WITH d
+        MERGE (s:ServiceItem {name: $service_name})
+        MERGE (d)-[:DESCRIBES]->(s)
+        WITH d, s
+        UNWIND $materials AS material_name
+        MERGE (m:Material {name: material_name})
+        MERGE (s)-[:REQUIRES {doc_id: $doc_id}]->(m)
+        WITH d, s
+        UNWIND $steps AS step
+        MERGE (st:Step {doc_id: $doc_id, index: step.index})
+        SET st.text = step.text
+        MERGE (s)-[:HAS_STEP {doc_id: $doc_id, index: step.index}]->(st)
+        WITH d, s
+        UNWIND $laws AS law_title
+        MERGE (l:Law {title: law_title})
+        MERGE (s)-[:BASED_ON {doc_id: $doc_id}]->(l)
+        WITH d, s
+        FOREACH (_ IN CASE WHEN $organization IS NULL THEN [] ELSE [1] END |
+          MERGE (o:Organization {name: $organization})
+          MERGE (s)-[:HANDLED_BY {doc_id: $doc_id}]->(o)
+        )
+        WITH d, s
+        FOREACH (_ IN CASE WHEN $address IS NULL THEN [] ELSE [1] END |
+          MERGE (loc:Location {address: $address})
+          MERGE (s)-[:HANDLED_AT {doc_id: $doc_id}]->(loc)
+        )
         """
         rel_dicts = [{"source": a, "type": t, "target": b} for (a, t, b) in relations]
         params = {
@@ -79,6 +142,12 @@ class Neo4jClient:
             "updated_at": _utc_now_iso(),
             "entities": entities,
             "relations": rel_dicts,
+            "service_name": service_name,
+            "materials": materials,
+            "steps": steps,
+            "laws": laws,
+            "organization": organization,
+            "address": address,
         }
         with self._driver.session(database=self._database) as session:
             session.execute_write(lambda tx: tx.run(cypher, params).consume())
@@ -93,18 +162,23 @@ class Neo4jClient:
 
             delete_cypher = """
             MATCH (d:Document {id: $doc_id})
-            OPTIONAL MATCH (d)-[m:MENTIONS]->()
-            DELETE m
-            WITH d
-            OPTIONAL MATCH ()-[r:RELATED {doc_id: $doc_id}]->()
-            DELETE r
-            WITH d
             DETACH DELETE d
+            WITH $doc_id AS doc_id
+            OPTIONAL MATCH ()-[r]->() WHERE r.doc_id = doc_id
+            DELETE r
+            WITH doc_id
+            OPTIONAL MATCH (st:Step {doc_id: doc_id})
+            DETACH DELETE st
             """
             session.execute_write(lambda tx: tx.run(delete_cypher, doc_id=doc_id).consume())
 
             if cleanup_orphans:
-                cleanup_cypher = "MATCH (e:Entity) WHERE NOT (e)--() DELETE e"
+                cleanup_cypher = """
+                MATCH (n)
+                WHERE (n:Entity OR n:ServiceItem OR n:Material OR n:Law OR n:Organization OR n:Location OR n:Step)
+                  AND NOT (n)--()
+                DELETE n
+                """
                 session.execute_write(lambda tx: tx.run(cleanup_cypher).consume())
 
         return True
@@ -112,11 +186,15 @@ class Neo4jClient:
     def get_document_summary(self, *, doc_id: str) -> dict[str, Any] | None:
         cypher = """
         MATCH (d:Document {id: $doc_id})
+        OPTIONAL MATCH (d)-[:DESCRIBES]->(s:ServiceItem)
         OPTIONAL MATCH (d)-[:MENTIONS]->(e:Entity)
-        WITH d, collect(distinct e.name) AS entities
+        WITH d, s, collect(distinct e.name) AS entities
         OPTIONAL MATCH ()-[r:RELATED {doc_id: $doc_id}]->()
-        WITH d, entities, count(r) AS relations_count
-        RETURN d.id AS id, d.name AS name, d.updated_at AS updated_at, entities AS entities, relations_count AS relations_count
+        WITH d, s, entities, count(r) AS relations_count
+        RETURN d.id AS id, d.name AS name, d.updated_at AS updated_at,
+               s.name AS service_name,
+               entities AS entities,
+               relations_count AS relations_count
         """
         with self._driver.session(database=self._database) as session:
             record = session.run(cypher, doc_id=doc_id).single()
@@ -126,6 +204,7 @@ class Neo4jClient:
                 "file_id": record["id"],
                 "file_name": record["name"],
                 "updated_at": record["updated_at"],
+                "service_name": record["service_name"],
                 "entities": record["entities"],
                 "relations_count": record["relations_count"],
             }
@@ -134,5 +213,16 @@ class Neo4jClient:
 def neo4j_error_to_message(err: Exception) -> str:
     if isinstance(err, Neo4jError):
         code = getattr(err, "code", None) or "Neo4jError"
+        message = getattr(err, "message", None) or str(err) or ""
+        message = message.replace("\r", " ").replace("\n", " ").strip()
+        if len(message) > 500:
+            message = message[:500] + "..."
+        if message:
+            return f"neo4j error: {code}: {message}"
         return f"neo4j error: {code}"
-    return "neo4j error"
+    message = str(err).strip()
+    if message:
+        if len(message) > 500:
+            message = message[:500] + "..."
+        return message
+    return f"{type(err).__name__}"

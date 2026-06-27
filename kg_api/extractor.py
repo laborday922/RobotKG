@@ -295,7 +295,7 @@ def _derive_entities_from_structured(structured: dict[str, Any]) -> set[str]:
     values = structured.get("values") or {}
     entities: set[str] = set()
 
-    for key in ("service_item", "service_content", "service_object", "organization", "address"):
+    for key in ("service_item", "organization", "address"):
         v = values.get(key)
         if isinstance(v, str):
             ent = _normalize_entity(v)
@@ -309,15 +309,6 @@ def _derive_entities_from_structured(structured: dict[str, Any]) -> set[str]:
                 continue
             ent = _normalize_entity(x)
             if 2 <= len(ent) <= 120:
-                entities.add(ent)
-
-    mats = values.get("materials")
-    if isinstance(mats, list):
-        for x in mats[:50]:
-            if not isinstance(x, str):
-                continue
-            ent = _normalize_entity(x)
-            if 2 <= len(ent) <= 80:
                 entities.add(ent)
 
     return entities
