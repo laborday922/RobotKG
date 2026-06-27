@@ -63,6 +63,8 @@ _KEYWORDS = [
 
 def _build_query_variants(query: str) -> list[str]:
     q = (query or "").strip().lower()
+    q = re.sub(r"[{}\[\]<>\"'`]+", " ", q)
+    q = re.sub(r"\s+", " ", q).strip()
     if not q:
         return []
 
@@ -101,12 +103,14 @@ def _build_query_variants(query: str) -> list[str]:
 
 def _tokenize_query(query: str) -> list[str]:
     q = (query or "").strip().lower()
+    q = re.sub(r"[{}\[\]<>\"'`]+", " ", q)
+    q = re.sub(r"\s+", " ", q).strip()
     if not q:
         return []
     parts = re.split(r"[\s,，。；;、/\\|]+", q)
     tokens: list[str] = []
     for p in parts:
-        p = p.strip()
+        p = p.strip().strip(".,;:!?，。；：！？()（）")
         if not p:
             continue
         if p in _STOPWORDS:
@@ -125,6 +129,7 @@ def _tokenize_query(query: str) -> list[str]:
             continue
         seen.add(t)
         uniq.append(t)
+    return uniq[:12]
 
 
 class Neo4jClient:
