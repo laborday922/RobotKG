@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
 from typing import Any, Protocol
+
+
+logger = logging.getLogger("uvicorn.error")
 
 
 @dataclass(frozen=True)
@@ -200,6 +204,13 @@ def coarse_extract_sections_regex(
             title = m.group("title").strip().strip("★*")
             rest = m.group("rest").strip()
             key = _map_heading_to_key(title, heading_aliases=heading_aliases)
+            if (
+                current_title is not None
+                and current_key in {"materials", "process", "policy_basis", "channels", "contact", "complaint"}
+                and re.match(r"^\d+\s*[\.、]?", title)
+            ):
+                current_lines.append(ln)
+                continue
             flush()
             current_title = title
             current_key = key
@@ -327,12 +338,45 @@ def extract_document(
         return ExtractedDocument(graph=ExtractedGraph(entities=set(), relations=[]), structured={"file_name": file_name, "sections": [], "values": {}, "keys": []})
 
     sections = coarse_extract_sections_regex(file_name=file_name, content=text, heading_aliases=heading_aliases)
+    section_pairs = [f"{s.title}:{s.key}" for s in sections]
+    section_preview = section_pairs[:15]
+    if len(section_pairs) > len(section_preview):
+        section_preview.append(f"...(+{len(section_pairs) - len(section_preview)})")
+    logger.info(
+        "extract sections file_name=%s sections=%s keys=%s",
+        file_name,
+        len(sections),
+        section_preview,
+    )
     if len(sections) < 2 and llm is not None:
         llm_sections = llm.coarse_structure(file_name=file_name, content=text)
         if llm_sections:
             sections = llm_sections
 
     structured = fine_extract_values_regex(file_name=file_name, sections=sections)
+    values = structured.get("values") if isinstance(structured, dict) else None
+    if not isinstance(values, dict):
+        values = {}
+    materials = values.get("materials") if isinstance(values.get("materials"), list) else []
+    process = values.get("process") if isinstance(values.get("process"), list) else []
+    policy_basis = values.get("policy_basis") if isinstance(values.get("policy_basis"), list) else []
+    service_item = values.get("service_item")
+    service_item_preview = None
+    if isinstance(service_item, str):
+        service_item_preview = service_item.strip().replace("\r", " ").replace("\n", " ")
+        if len(service_item_preview) > 80:
+            service_item_preview = service_item_preview[:80] + "..."
+    logger.info(
+        "extract values file_name=%s has_material_section=%s has_process_section=%s has_policy_section=%s materials=%s process=%s policy_basis=%s service_item=%s",
+        file_name,
+        any(s.key == "materials" for s in sections),
+        any(s.key == "process" for s in sections),
+        any(s.key == "policy_basis" for s in sections),
+        len(materials),
+        len(process),
+        len(policy_basis),
+        service_item_preview,
+    )
     if llm is not None:
         values = structured.get("values") or {}
         for sec in sections:

@@ -77,6 +77,21 @@ class Neo4jClient:
         organization = str(values.get("organization") or "").strip() or None
         address = str(values.get("address") or "").strip() or None
 
+        materials_preview = materials[:3]
+        if len(materials) > len(materials_preview):
+            materials_preview = materials_preview + [f"...(+{len(materials) - len(materials_preview)})"]
+        logger.info(
+            "neo4j upsert graph doc_id=%s service_name=%s materials=%s steps=%s laws=%s organization=%s address=%s materials_preview=%s",
+            doc_id,
+            service_name,
+            len(materials),
+            len(steps),
+            len(laws),
+            organization,
+            address,
+            materials_preview,
+        )
+
         cypher = """
         MERGE (d:Document {id: $doc_id})
         SET d.name = $doc_name,
@@ -97,31 +112,31 @@ class Neo4jClient:
         OPTIONAL MATCH (st:Step {doc_id: $doc_id})
         DETACH DELETE st
         WITH d
-        UNWIND $entities AS entity_name
-        MERGE (e:Entity {name: entity_name})
-        MERGE (d)-[:MENTIONS]->(e)
-        WITH d
-        UNWIND $relations AS rel
-        MERGE (a:Entity {name: rel.source})
-        MERGE (b:Entity {name: rel.target})
-        MERGE (a)-[:RELATED {doc_id: $doc_id, type: rel.type}]->(b)
-        WITH d
+        FOREACH (entity_name IN $entities |
+          MERGE (e:Entity {name: entity_name})
+          MERGE (d)-[:MENTIONS]->(e)
+        )
+        FOREACH (rel IN $relations |
+          MERGE (a:Entity {name: rel.source})
+          MERGE (b:Entity {name: rel.target})
+          MERGE (a)-[:RELATED {doc_id: $doc_id, type: rel.type}]->(b)
+        )
         MERGE (s:ServiceItem {name: $service_name})
         MERGE (d)-[:DESCRIBES]->(s)
         WITH d, s
-        UNWIND $materials AS material_name
-        MERGE (m:Material {name: material_name})
-        MERGE (s)-[:REQUIRES {doc_id: $doc_id}]->(m)
-        WITH d, s
-        UNWIND $steps AS step
-        MERGE (st:Step {doc_id: $doc_id, index: step.index})
-        SET st.text = step.text
-        MERGE (s)-[:HAS_STEP {doc_id: $doc_id, index: step.index}]->(st)
-        WITH d, s
-        UNWIND $laws AS law_title
-        MERGE (l:Law {title: law_title})
-        MERGE (s)-[:BASED_ON {doc_id: $doc_id}]->(l)
-        WITH d, s
+        FOREACH (material_name IN $materials |
+          MERGE (m:Material {name: material_name})
+          MERGE (s)-[:REQUIRES {doc_id: $doc_id}]->(m)
+        )
+        FOREACH (step IN $steps |
+          MERGE (st:Step {doc_id: $doc_id, index: step.index})
+          SET st.text = step.text
+          MERGE (s)-[:HAS_STEP {doc_id: $doc_id, index: step.index}]->(st)
+        )
+        FOREACH (law_title IN $laws |
+          MERGE (l:Law {title: law_title})
+          MERGE (s)-[:BASED_ON {doc_id: $doc_id}]->(l)
+        )
         FOREACH (_ IN CASE WHEN $organization IS NULL THEN [] ELSE [1] END |
           MERGE (o:Organization {name: $organization})
           MERGE (s)-[:HANDLED_BY {doc_id: $doc_id}]->(o)
