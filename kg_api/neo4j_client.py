@@ -121,12 +121,16 @@ class Neo4jClient:
              collect(distinct loc.address) AS addrs,
              collect(distinct m.name) AS materials,
              collect(distinct l.title) AS laws,
-             collect(distinct st.index) AS step_indexes,
+             collect(distinct st.index) AS step_indexes_raw,
              collect(distinct e.name) AS entities
         WITH d, s,
              head([x IN orgs WHERE x IS NOT NULL]) AS organization,
              head([x IN addrs WHERE x IS NOT NULL]) AS address,
-             materials, laws, step_indexes, entities,
+             [x IN materials WHERE x IS NOT NULL] AS materials,
+             [x IN laws WHERE x IS NOT NULL] AS laws,
+             [x IN step_indexes_raw WHERE x IS NOT NULL] AS step_indexes,
+             [x IN entities WHERE x IS NOT NULL] AS entities
+        WITH d, s, organization, address, materials, laws, step_indexes, entities,
              toLower(coalesce(d.name, "")) AS dn,
              toLower(coalesce(d.content, "")) AS dc,
              toLower(coalesce(s.name, "")) AS sn,

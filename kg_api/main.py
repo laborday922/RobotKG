@@ -211,26 +211,33 @@ def get_file(file_id: str, client: Neo4jClient = Depends(neo4j)) -> OkResponse:
 # 用关键词检索候选文档，返回 doc_id
 @app.get("/qa/search", response_model=OkResponse, tags=["qa"], dependencies=[Depends(auth_dependency)])
 def qa_search(query: str, top_k: int = 5, client: Neo4jClient = Depends(neo4j)) -> OkResponse:
+    req_id = uuid.uuid4().hex[:10]
     try:
-        logger.info("qa.search query=%r top_k=%s", query, top_k)
+        logger.info("qa.search start (req_id=%s) query=%r top_k=%s", req_id, query, top_k)
         results = client.search_documents(query=query, top_k=top_k)
         items = [QaSearchItem(**r).model_dump() for r in results]
+        logger.info("qa.search ok (req_id=%s) results=%s", req_id, len(items))
         return OkResponse(ok=True, message="ok", data={"query": query, "top_k": min(max(int(top_k), 1), 20), "results": items})
     except Exception as e:
         msg = neo4j_error_to_message(e)
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=msg)
+        logger.exception("qa.search failed (req_id=%s) query=%r top_k=%s err=%s", req_id, query, top_k, e)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"{msg} (req_id={req_id})")
 
 # 拿某个 doc_id 的结构化详情
 @app.get("/qa/doc/{doc_id}", response_model=OkResponse, tags=["qa"], dependencies=[Depends(auth_dependency)])
 def qa_doc_detail(doc_id: str, client: Neo4jClient = Depends(neo4j)) -> OkResponse:
+    req_id = uuid.uuid4().hex[:10]
     try:
+        logger.info("qa.doc start (req_id=%s) doc_id=%s", req_id, doc_id)
         detail = client.get_document_detail(doc_id=doc_id)
         if not detail:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="file not found")
         data = QaDocDetail(**detail).model_dump()
+        logger.info("qa.doc ok (req_id=%s) doc_id=%s", req_id, doc_id)
         return OkResponse(ok=True, message="ok", data=data)
     except HTTPException:
         raise
     except Exception as e:
         msg = neo4j_error_to_message(e)
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=msg)
+        logger.exception("qa.doc failed (req_id=%s) doc_id=%s err=%s", req_id, doc_id, e)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"{msg} (req_id={req_id})")
