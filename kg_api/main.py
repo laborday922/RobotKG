@@ -22,6 +22,7 @@ logger = logging.getLogger("uvicorn.error")
 def _require_token(authorization: str | None) -> None:
     if not settings.api_token:
         return
+    if not authorization:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="missing token")
     prefix = "Bearer "
     if not authorization.startswith(prefix):

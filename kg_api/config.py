@@ -9,9 +9,9 @@ class Settings(BaseSettings):
 
     api_token: str | None = Field(default=None)
 
-    neo4j_uri: str = Field(default="bolt://8.163.1.154:7687")
+    neo4j_uri: str = Field(default="bolt://localhost:7687")
     neo4j_user: str = Field(default="neo4j")
-    neo4j_password: str = Field(default="Xmu@210Robot")
+    neo4j_password: str = Field(default="")
     neo4j_database: str | None = Field(default=None)
     neo4j_create_schema: bool = Field(default=True)
 
